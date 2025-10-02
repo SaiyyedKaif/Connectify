@@ -16,23 +16,62 @@ const {
 
 const app = express();
 const server = http.createServer(app);
-const io = socketio(server);
+const io = socketio(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
 // Set static folder
 app.use(express.static(path.join(__dirname, "public")));
 
 const botName = "ChatCord Bot";
 
+// Initialize Redis clients with environment variable support
+let pubClient, subClient;
+
 (async () => {
-  pubClient = createClient({ url: "redis://127.0.0.1:6379" });
-  await pubClient.connect();
-  subClient = pubClient.duplicate();
-  io.adapter(createAdapter(pubClient, subClient));
+  try {
+    // Use REDIS_URL environment variable if available, fallback to localhost for development
+    const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+    
+    console.log("Connecting to Redis...");
+    pubClient = createClient({ url: redisUrl });
+    
+    // Add error handling for Redis connection
+    pubClient.on('error', (err) => {
+      console.error('Redis pub client error:', err);
+    });
+    
+    pubClient.on('connect', () => {
+      console.log('Redis pub client connected');
+    });
+    
+    await pubClient.connect();
+    subClient = pubClient.duplicate();
+    
+    subClient.on('error', (err) => {
+      console.error('Redis sub client error:', err);
+    });
+    
+    await subClient.connect();
+    
+    // Set up Redis adapter for Socket.io
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log("Redis adapter configured successfully");
+    
+  } catch (error) {
+    console.error("Failed to connect to Redis:", error);
+    console.log("Running without Redis adapter - single server mode");
+    // The app will continue to work without Redis, just without multi-server scaling
+  }
 })();
 
 // Run when client connects
 io.on("connection", (socket) => {
-  console.log(io.of("/").adapter);
+  console.log(`New client connected: ${socket.id}`);
+  
   socket.on("joinRoom", ({ username, room }) => {
     const user = userJoin(socket.id, username, room);
 
@@ -60,7 +99,9 @@ io.on("connection", (socket) => {
   socket.on("chatMessage", (msg) => {
     const user = getCurrentUser(socket.id);
 
-    io.to(user.room).emit("message", formatMessage(user.username, msg));
+    if (user) {
+      io.to(user.room).emit("message", formatMessage(user.username, msg));
+    }
   });
 
   // Runs when client disconnects
@@ -82,6 +123,23 @@ io.on("connection", (socket) => {
   });
 });
 
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  if (pubClient) {
+    await pubClient.quit();
+  }
+  if (subClient) {
+    await subClient.quit();
+  }
+  server.close(() => {
+    console.log('Process terminated');
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
